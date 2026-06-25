@@ -8,6 +8,11 @@ import { DEFAULT_LOCALE, LOCALE_COOKIE } from "@/i18n/config";
 import fs from "node:fs";
 import path from "node:path";
 import { marked } from "marked";
+import createDOMPurify from "dompurify";
+import { JSDOM } from "jsdom";
+
+const window = new JSDOM("").window;
+const DOMPurify = createDOMPurify(window as unknown as Window);
 
 // ── Locale detection ────────────────────────────────────────────────────────
 
@@ -25,15 +30,33 @@ function getDocsLocale(): string {
 // `docs/i18n/<locale>/docs/<section>/<FILE>.md` — the exact path layout that
 // `scripts/i18n/run-translation.mjs` produces. Returns rendered HTML or null.
 
-function tryI18nFallback(slug: string[], locale: string): string | null {
+export function tryI18nFallback(slug: string[], locale: string): string | null {
+  // SECURITY: Prevent path traversal by sanitizing locale/slug and verifying
+  // the resolved path remains within the docs/i18n root. HTML output is
+  // sanitized via DOMPurify to prevent XSS from malicious markdown content.
   if (!locale || locale === "en") return null;
 
+  // 1. Sanitize locale: only alphanumeric and hyphens allowed (e.g. "pt-BR")
+  if (!/^[a-z0-9-]+$/i.test(locale)) return null;
+
+  // 2. Resolve the base directory for i18n docs
   const docsRoot = path.resolve(process.cwd(), "docs");
-  const sectionDir = path.join(docsRoot, "i18n", locale, "docs", ...slug.slice(0, -1));
+  const i18nRoot = path.join(docsRoot, "i18n");
+
+  // 3. Sanitize and construct the section directory path
+  // Remove any path traversal segments from the slug
+  const safeSlug = slug.filter((segment) => segment !== ".." && segment !== ".");
+  const sectionDir = path.join(i18nRoot, locale, "docs", ...safeSlug.slice(0, -1));
+
+  // 4. Defense-in-depth: Ensure the resolved sectionDir is still within i18nRoot
+  if (!path.resolve(sectionDir).startsWith(i18nRoot)) return null;
+
   if (!fs.existsSync(sectionDir)) return null;
 
   // Fumadocs lowercases slugs — match case-insensitively against i18n dir
-  const target = slug[slug.length - 1];
+  const target = safeSlug[safeSlug.length - 1];
+  if (!target) return null;
+
   let files: string[];
   try {
     files = fs.readdirSync(sectionDir);
@@ -45,6 +68,10 @@ function tryI18nFallback(slug: string[], locale: string): string | null {
   if (!match) return null;
 
   const filePath = path.join(sectionDir, match);
+
+  // 5. Final safety check: ensure the actual file is still within i18nRoot
+  if (!path.resolve(filePath).startsWith(i18nRoot)) return null;
+
   const raw = fs.readFileSync(filePath, "utf8");
 
   // Strip the i18n header (heading + language bar + ---) before rendering.
@@ -55,7 +82,10 @@ function tryI18nFallback(slug: string[], locale: string): string | null {
       ? raw.slice(bodyMatch.index + bodyMatch[0].length).trim()
       : raw;
 
-  return marked.parse(body) as string;
+  const html = marked.parse(body) as string;
+
+  // 6. Sanitize the HTML for defense-in-depth against XSS
+  return DOMPurify.sanitize(html);
 }
 
 // ── Page component ──────────────────────────────────────────────────────────
